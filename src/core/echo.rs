@@ -1,17 +1,26 @@
 use std::net::SocketAddr;
 
 use crate::core::{
+    crypto::KeyPair,
+    protocol::HandshakeInitiation,
     tun::Tun,
     udp::{self, UdpTransport},
 };
 
 // this sets up the Tun -> Udp and Udp -> Tun
 pub fn run_echo(server_addr: SocketAddr) -> std::io::Result<()> {
-    let tun = Tun::new("tun0".to_string())?;
+    let tun = Tun::new()?;
     println!("TUN {} created (fd={})", tun.name, tun.fd);
     let mut udp = UdpTransport::new("0.0.0.0:0".parse().unwrap(), server_addr)?;
     println!("UDP bound and connected to {}", server_addr);
 
+    let keypair = KeyPair::generate();
+    let sender_index = 12345; // In real: random u32
+
+    let handshake = HandshakeInitiation::new(sender_index, keypair.public_key);
+    let handshake_bytes = handshake.to_bytes();
+    udp.send(&handshake_bytes)?;
+    println!("Sent handshake ({} bytes)", handshake_bytes.len());
     let mut buf = vec![0; 1024];
 
     println!("echo tunnel started try to ping at 10.0.0.1");

@@ -1,90 +1,133 @@
-use libc::{c_int, c_short, close, ifreq, ioctl, open, read, write};
+use libc::{
+    AF_SYS_CONTROL, AF_SYSTEM, CTLIOCGINFO, SOCK_DGRAM, c_char, c_int, close, connect, getsockopt,
+    read, socket, write,
+};
 use std::{
-    ffi::{CString, c_void},
-    os::unix::io::{AsRawFd, RawFd},
+    ffi::{CStr, c_void},
+    io, mem,
+    os::unix::io::RawFd,
+    ptr,
 };
 
-const IFF_TUN: c_short = 0x0001;
-const IFF_NO_PI: c_short = 0x1000;
-const TUNSETIFF: c_int = 0x400454d2; // macOS-specific value (differs from Linux)
+const SYSPROTO_CONTROL: c_int = 2;
+const UTUN_CONTROL_NAME: &str = "com.apple.net.utun_control\0";
+const UTUN_OPT_IFNAME: c_int = 2;
 
-#[cfg(target_os = "macos")]
-pub struct Tun {
-    pub name: String,
-    pub fd: RawFd,
+#[repr(C)]
+struct ctl_info {
+    ctl_id: u32,
+    ctl_name: [c_char; 96],
 }
 
-#[cfg(target_os = "macos")]
+#[repr(C)]
+struct sockaddr_ctl {
+    sc_len: u8,
+    sc_family: u8,
+    ss_sysaddr: u16,
+    sc_id: u32,
+    sc_unit: u32,
+    sc_reserved: [u32; 5],
+}
+
+pub struct Tun {
+    pub fd: RawFd,
+    pub name: String,
+}
+
 impl Tun {
-    pub fn new(name: String) -> std::io::Result<Self> {
-        // Dynamically find available utunX
-        let utun_path = find_available_utun()?;
-        let fd = unsafe { open(utun_path.as_ptr() as *const i8, libc::O_RDWR) };
+    pub fn new() -> io::Result<Self> {
+        let fd = unsafe { socket(libc::PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL) };
         if fd < 0 {
-            return Err(std::io::Error::last_os_error());
+            return Err(io::Error::last_os_error());
         }
 
-        let mut ifr: ifreq = unsafe { std::mem::zeroed() };
-        let name_cstr = CString::new(name.clone()).unwrap();
+        let mut info = ctl_info {
+            ctl_id: 0,
+            ctl_name: [0; 96],
+        };
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                name_cstr.as_ptr(),
-                ifr.ifr_name.as_mut_ptr(),
-                name.len(),
+            ptr::copy_nonoverlapping(
+                UTUN_CONTROL_NAME.as_ptr() as *const c_char,
+                info.ctl_name.as_mut_ptr(),
+                UTUN_CONTROL_NAME.len() - 1,
             );
         }
-        ifr.ifr_ifru.ifru_flags = (IFF_TUN | IFF_NO_PI) as _;
 
-        if unsafe { ioctl(fd, TUNSETIFF as _, &ifr) } < 0 {
-            let err = std::io::Error::last_os_error();
+        if unsafe { libc::ioctl(fd, CTLIOCGINFO, &mut info) } < 0 {
+            let err = io::Error::last_os_error();
             unsafe { close(fd) };
             return Err(err);
         }
 
+        let addr = sockaddr_ctl {
+            sc_len: mem::size_of::<sockaddr_ctl>() as u8,
+            sc_family: AF_SYSTEM as u8,
+            ss_sysaddr: AF_SYS_CONTROL as u16,
+            sc_id: info.ctl_id,
+            sc_unit: 0,
+            sc_reserved: [0; 5],
+        };
+
+        if unsafe {
+            connect(
+                fd,
+                &addr as *const _ as *const libc::sockaddr,
+                mem::size_of::<sockaddr_ctl>() as u32,
+            )
+        } < 0
+        {
+            let err = io::Error::last_os_error();
+            unsafe { close(fd) };
+            return Err(err);
+        }
+
+        let mut ifname = [0 as c_char; 32];
+        let mut len = 32 as libc::socklen_t;
+        if unsafe {
+            getsockopt(
+                fd,
+                SYSPROTO_CONTROL,
+                UTUN_OPT_IFNAME,
+                ifname.as_mut_ptr() as *mut c_void,
+                &mut len,
+            )
+        } < 0
+        {
+            let err = io::Error::last_os_error();
+            unsafe { close(fd) };
+            return Err(err);
+        }
+
+        let name = unsafe { CStr::from_ptr(ifname.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+
+        println!("Created utun interface: {}", name);
+
         Ok(Tun { fd, name })
     }
 
-    pub fn read<'a>(&self, buf: &'a mut [u8]) -> std::io::Result<&'a [u8]> {
-        let n = unsafe { read(self.fd, buf.as_mut_ptr() as _, buf.len()) };
+    pub fn read<'a>(&self, buf: &'a mut [u8]) -> io::Result<&'a [u8]> {
+        let n = unsafe { read(self.fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
         if n < 0 {
-            return Err(std::io::Error::last_os_error());
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(&buf[..n as usize])
         }
-        Ok(&buf[..n as usize])
     }
 
-    pub fn write(&self, data: &[u8]) -> std::io::Result<()> {
-        let n = unsafe { write(self.fd, data.as_ptr() as _, data.len()) };
+    pub fn write(&self, data: &[u8]) -> io::Result<()> {
+        let n = unsafe { write(self.fd, data.as_ptr() as *const c_void, data.len()) };
         if n < 0 {
-            return Err(std::io::Error::last_os_error());
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
         }
-        Ok(())
     }
 }
 
-#[cfg(target_os = "macos")]
-fn find_available_utun() -> std::io::Result<CString> {
-    for i in 0..16 {
-        // Check utun0 to utun15
-        let path = format!("/dev/utun{}", i);
-        let c_path = CString::new(path)?;
-        let fd = unsafe { open(c_path.as_ptr() as *const i8, libc::O_RDWR) };
-        if fd >= 0 {
-            unsafe { close(fd) }; // Close and reuse
-            return Ok(c_path);
-        }
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "No available utun device",
-    ))
-}
-
-#[cfg(target_os = "macos")]
 impl Drop for Tun {
     fn drop(&mut self) {
         unsafe { close(self.fd) };
     }
 }
-
-// For cross-platform: Your original Linux code can be wrapped in #[cfg(target_os = "linux")]
-
