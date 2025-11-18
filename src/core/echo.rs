@@ -38,7 +38,12 @@ pub fn run_echo(server_addr: SocketAddr) -> std::io::Result<()> {
         match udp.recv(&mut buf) {
             Ok(Some(n)) => {
                 println!("udp to tun {} bytes", n);
-                tun.write(&buf[..n])?;
+                let data = &buf[..n];
+                if data[0] == 2 {
+                    println!("Handshake Initialization started")
+                } else {
+                    tun.write(&buf[..n])?;
+                }
             }
             Ok(None) => {}
             Err(e) => return Err(e),
