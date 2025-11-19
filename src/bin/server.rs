@@ -12,7 +12,6 @@ struct Peer {
     addr: SocketAddr,
     client_index: u32,
     client_ephem: [u8; 32],
-    // keys will be added next step
 }
 
 fn main() -> std::io::Result<()> {
@@ -61,8 +60,6 @@ fn main() -> std::io::Result<()> {
                         println!("Sent type 2 response");
                     }
                 }
-
-                // Future: handle type 4 encrypted packets here
             }
         }
     }
