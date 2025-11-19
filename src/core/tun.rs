@@ -36,11 +36,13 @@ pub struct Tun {
 
 impl Tun {
     pub fn new() -> io::Result<Self> {
+        // opening a raw socket
         let fd = unsafe { socket(libc::PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
 
+        // makiing struct to get the control name
         let mut info = ctl_info {
             ctl_id: 0,
             ctl_name: [0; 96],
@@ -53,12 +55,15 @@ impl Tun {
             );
         }
 
+        // The ioctl() system call manipulates the underlying device
+        // parameters of special files.
         if unsafe { libc::ioctl(fd, CTLIOCGINFO, &mut info) } < 0 {
             let err = io::Error::last_os_error();
             unsafe { close(fd) };
             return Err(err);
         }
 
+        // make a clone of the C sockaddr struct
         let addr = sockaddr_ctl {
             sc_len: mem::size_of::<sockaddr_ctl>() as u8,
             sc_family: AF_SYSTEM as u8,
@@ -68,6 +73,7 @@ impl Tun {
             sc_reserved: [0; 5],
         };
 
+        // connect to the socket
         if unsafe {
             connect(
                 fd,
@@ -98,6 +104,7 @@ impl Tun {
             return Err(err);
         }
 
+        // Cstr -> String
         let name = unsafe { CStr::from_ptr(ifname.as_ptr()) }
             .to_string_lossy()
             .into_owned();
